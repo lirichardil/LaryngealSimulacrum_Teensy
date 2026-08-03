@@ -1,0 +1,12 @@
+# Arduino / Teensy build output
+build/
+*.hex
+*.elf
+*.eep
+*.lst
+*.sym
+
+# OneDrive / Windows
+Thumbs.db
+desktop.ini
+~$*
