@@ -36,9 +36,17 @@
 // --- Level gate: this and only this decides whether sound comes out --------
 // OPEN starts an utterance, CLOSE ends one. The wide gap plus the hangover
 // below is what carries the output through consonants and short pauses.
-// CALIBRATE THESE from the in: field. OPEN must be > CLOSE.
+//
+// These two are measured on DIFFERENT signals, deliberately:
+//   OPEN  -> raw level (the in: field). Onset happens while we are silent, so
+//            there is no feedback to reject and the full signal is wanted.
+//   CLOSE -> notch-filtered level (the ntc: field), with our own output
+//            frequency removed, so our own tone cannot hold the gate open.
+// CALIBRATE SEPARATELY. Notching removes the voice fundamental too, so the
+// notched level runs maybe 20-30% below the raw one - CLOSE needs to come
+// down accordingly. OPEN must still be > CLOSE in absolute terms.
 #define INPUT_RMS_OPEN             0.030f
-#define INPUT_RMS_CLOSE            0.012f
+#define INPUT_RMS_CLOSE            0.008f
 
 // How long the output keeps sounding after the level falls away. This is the
 // single most important knob for continuity: it has to outlast the silent
@@ -46,6 +54,34 @@
 // between words too. Raise it if the output still breaks up inside a phrase;
 // lower it if the tone hangs on too long after you actually stop.
 #define SPEECH_HANGOVER_MS         250
+
+// --- Acoustic feedback rejection -------------------------------------------
+// The coils vibrate, that vibration conducts through tissue to the contact
+// mic, the level never falls, the hangover timer never starts, and the output
+// sustains forever. Confirmed on hardware: the runaway appears only once the
+// coils are connected. Loop gain scales with OUTPUT_AMPLITUDE, so raising the
+// output to hit the 3Vp-p coil requirement is what made it obvious.
+//
+// The exploitable asymmetry is that we know exactly what we are emitting: a
+// PURE SINE at smoothF0, no harmonics. A real voice at the same f0 carries
+// strong harmonics at 2f0, 3f0... So measuring level with f0 notched out
+// leaves speech largely intact while gutting our own tone - 15-25dB of
+// discrimination.
+//
+// Q sets notch width. Too high and the notch misses as the pitch glides
+// between retunes; too low and it eats voice harmonics. 4 is ~f0/4 wide.
+#define NOTCH_Q                    4.0f
+
+// Retune the notch once smoothF0 has drifted this fraction from where the
+// notch is currently centred. Recomputing coefficients costs sin/cos, so this
+// avoids doing it every millisecond for no benefit.
+#define NOTCH_RETUNE_RATIO         0.02f
+
+// Hard backstop on a single continuous utterance. Nothing legitimate runs this
+// long, so hitting it means the gate is stuck - feedback lock-in, or a noise
+// source holding the level up. Guarantees the output always eventually stops
+// instead of running indefinitely.
+#define MAX_UTTERANCE_MS           8000
 
 // --- Onset qualification: anti-ghosting, and ONLY applied at cold start ----
 // To begin an utterance we require real evidence of phonation - a run of

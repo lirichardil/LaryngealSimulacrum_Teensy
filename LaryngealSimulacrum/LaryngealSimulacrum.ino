@@ -38,18 +38,28 @@
 
 AudioInputI2S            audioInput;
 AudioFilterBiquad         inputHp;
+AudioFilterBiquad         notchF0;
 AudioAnalyzeNoteFrequency notefreq;
 AudioAnalyzeRMS           inputRms;
+AudioAnalyzeRMS           notchRms;
 AudioSynthWaveformSine    sineL;
 AudioSynthWaveformSine    sineR;
 AudioOutputI2S            audioOutput;
 AudioControlSGTL5000      sgtl5000;
 
-// Both analysis taps read the high-passed signal, so the level gate measures
-// voice-band energy rather than rumble, and the tracker never sees it either.
+// All analysis reads the high-passed signal, so nothing sees sub-phonation
+// rumble. Two level meters, deliberately measuring different things:
+//
+//   inputRms  - raw. Used for ONSET, which happens while we are silent, so
+//               there is no feedback to reject and notching would only remove
+//               the voice fundamental at the moment detection is hardest.
+//   notchRms  - with our own output frequency notched out. Used for the STOP
+//               decision, so our own tone cannot hold the gate open forever.
 AudioConnection patchHp(audioInput, 0, inputHp, 0);
 AudioConnection patchIn(inputHp, 0, notefreq, 0);
 AudioConnection patchLevel(inputHp, 0, inputRms, 0);
+AudioConnection patchNotch(inputHp, 0, notchF0, 0);
+AudioConnection patchNotchLevel(notchF0, 0, notchRms, 0);
 AudioConnection patchOutL(sineL, 0, audioOutput, 0);
 AudioConnection patchOutR(sineR, 0, audioOutput, 1);
 
@@ -57,7 +67,9 @@ AudioConnection patchOutR(sineR, 0, audioOutput, 1);
 bool speaking = false;
 bool prevSpeaking = false;
 bool levelOpen = false;
-float lastRms = 0.0f;
+float lastRms = 0.0f;       // raw level      - drives ONSET
+float lastNotchRms = 0.0f;  // notched level  - drives STOP
+float notchTunedHz = DEFAULT_FREQ_HZ;
 
 // --- Pitch (YIN-driven, never gates the output) ----------------------------
 // targetF0 is the most recent accepted estimate; smoothF0 glides toward it and
@@ -85,10 +97,16 @@ float currentAmp = 0.0f;
 // threshold, repeat. This should stay very low now - ideally one per sentence.
 uint32_t dropouts = 0;
 
+// Times the MAX_UTTERANCE_MS backstop had to fire. This should be ZERO in
+// normal use - any nonzero value means the gate got stuck and only the
+// backstop released it, which is a feedback or noise problem, not tuning.
+uint32_t forcedStops = 0;
+
 elapsedMillis sincePrint;
 elapsedMillis sinceUpdate;
 elapsedMillis sinceRmsRead;
 elapsedMillis sinceLevelOk;
+elapsedMillis sinceSpeakingStart;
 
 void setup() {
   Serial.begin(115200);
@@ -118,6 +136,9 @@ void setup() {
   // sagging 6dB at the corner, which two default-Q sections would do.
   inputHp.setHighpass(0, INPUT_HP_HZ, 0.54120f);
   inputHp.setHighpass(1, INPUT_HP_HZ, 1.30656f);
+
+  // Feedback-rejection notch, retuned in the loop to track our own output.
+  notchF0.setNotch(0, notchTunedHz, NOTCH_Q);
 
   sineL.frequency(smoothF0);
   sineL.amplitude(0.0f);
@@ -150,12 +171,26 @@ void loop() {
   // read() averages everything accumulated since the last call, so sampling on
   // a fixed interval rather than every available() block gives a longer RMS
   // window and no chatter at the glottal-cycle rate.
-  if (sinceRmsRead >= RMS_WINDOW_MS && inputRms.available()) {
+  if (sinceRmsRead >= RMS_WINDOW_MS && inputRms.available() && notchRms.available()) {
     sinceRmsRead = 0;
     lastRms = inputRms.read();
+    lastNotchRms = notchRms.read();
 
+    // Retune the notch to whatever we are currently emitting. Only while
+    // speaking - when silent there is no output to reject, and recomputing
+    // coefficients costs sin/cos so it is not worth doing for nothing.
+    if (speaking && smoothF0 >= F0_MIN_HZ &&
+        fabsf(smoothF0 - notchTunedHz) > notchTunedHz * NOTCH_RETUNE_RATIO) {
+      notchTunedHz = smoothF0;
+      notchF0.setNotch(0, notchTunedHz, NOTCH_Q);
+    }
+
+    // Asymmetric by design, and this is the feedback fix. Opening reads the
+    // RAW level: onset happens while we are silent, so the full signal is
+    // wanted. Closing reads the NOTCHED level, with our own tone removed, so
+    // feedback cannot hold the gate open indefinitely.
     if (lastRms >= INPUT_RMS_OPEN) levelOpen = true;
-    else if (lastRms < INPUT_RMS_CLOSE) levelOpen = false;
+    else if (lastNotchRms < INPUT_RMS_CLOSE) levelOpen = false;
 
     if (levelOpen) sinceLevelOk = 0;
   }
@@ -193,16 +228,24 @@ void loop() {
     // Starting needs both: enough level, and real evidence of phonation.
     if (levelOpen && onsetRun >= VOICED_ONSET_COUNT) {
       speaking = true;
+      sinceSpeakingStart = 0;
       // Climb from wherever the decay left us rather than snapping, so the
       // coils are eased into motion. F0_RISE_MS governs the climb.
       pitchRising = true;
     }
   } else {
-    // Stopping needs only sustained absence of level. The hangover is what
-    // carries the tone across plosive closures and short inter-word pauses.
-    if (sinceLevelOk >= SPEECH_HANGOVER_MS) {
+    // Stopping needs sustained absence of level. The hangover is what carries
+    // the tone across plosive closures and short inter-word pauses.
+    //
+    // MAX_UTTERANCE_MS is a backstop, not a normal exit: nothing legitimate
+    // runs that long, so reaching it means the gate is stuck - feedback
+    // lock-in, or a noise source holding the level up. Without it a single
+    // false onset under feedback would sound forever.
+    if (sinceLevelOk >= SPEECH_HANGOVER_MS || sinceSpeakingStart >= MAX_UTTERANCE_MS) {
+      if (sinceSpeakingStart >= MAX_UTTERANCE_MS) forcedStops++;
       speaking = false;
       onsetRun = 0;
+      levelOpen = false;   // force a genuine re-qualification, not an instant restart
     }
   }
 
@@ -277,6 +320,12 @@ void loop() {
 #else
     Serial.print("in: ");
     Serial.print(lastRms, 4);
+    // The gap between in: and ntc: IS the feedback measurement. Our own tone
+    // is a pure sine, so the notch guts it: while the coils are ringing but
+    // nobody is speaking, ntc: should collapse well below in:. During real
+    // speech the harmonics survive and the two stay closer together.
+    Serial.print(" ntc: ");
+    Serial.print(lastNotchRms, 4);
     Serial.print("  F0 tgt:");
     Serial.print(targetF0, 1);
     Serial.print(" out:");
@@ -291,7 +340,9 @@ void loop() {
     Serial.print(currentAmp, 2);
     Serial.print(speaking ? "  [ON] " : "  [off]");
     Serial.print("  drops:");
-    Serial.println(dropouts);
+    Serial.print(dropouts);
+    Serial.print(" forced:");
+    Serial.println(forcedStops);
 #endif
   }
 }
