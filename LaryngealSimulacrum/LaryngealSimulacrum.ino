@@ -209,11 +209,25 @@ void loop() {
 
     // Onset qualification. Only relevant while silent - once speaking, none of
     // this is re-checked, which is precisely why nothing can chop mid-phrase.
+    //
+    // levelOpen is part of the CONDITION, not just checked later at the gate.
+    // That matters: without it the run accumulates during ambient noise while
+    // the level gate is shut, so it sits pre-satisfied and the next level blip
+    // fires instantly with no real stability evidence at all. The N agreeing
+    // frames have to happen WHILE the level is up, or they prove nothing.
     if (!speaking) {
-      if (inRange && lastProbability >= ONSET_PERIODICITY) {
+      if (levelOpen && inRange && lastProbability >= ONSET_PERIODICITY) {
         bool agrees = onsetRun > 0 &&
                       fabsf(freqHz - onsetFreqHz) <= onsetFreqHz * F0_AGREE_RATIO;
-        onsetRun = agrees ? onsetRun + 1 : 1;
+        if (agrees) {
+          // Clamped. onsetRun is uint8_t and this used to increment without
+          // bound, so ~255 frames of agreeing noise (about 18 seconds) wrapped
+          // it back to 0 - which made the trigger behaviour change character
+          // on an 18-second cycle for no visible reason.
+          if (onsetRun < VOICED_ONSET_COUNT) onsetRun++;
+        } else {
+          onsetRun = 1;
+        }
         onsetFreqHz = freqHz;
       } else {
         onsetRun = 0;
@@ -342,7 +356,13 @@ void loop() {
     Serial.print("  drops:");
     Serial.print(dropouts);
     Serial.print(" forced:");
-    Serial.println(forcedStops);
+    Serial.print(forcedStops);
+    // Restored - this was dropped in the decoupled rewrite, and it is exactly
+    // the diagnostic for "works at first, misbehaves after a while". It only
+    // ever rises. If it creeps toward the AudioMemory() figure over minutes,
+    // blocks are being starved and the fault is in the audio graph, not here.
+    Serial.print(" mem:");
+    Serial.println(AudioMemoryUsageMax());
 #endif
   }
 }
