@@ -318,7 +318,16 @@ void loop() {
   // =========================================================================
   // 5. DIAGNOSTICS
   // =========================================================================
-  if (sincePrint >= SERIAL_PRINT_INTERVAL_MS) {
+  // `if (Serial)` is load-bearing, not decoration. usb_serial.c blocks in
+  // usb_serial_write for up to TX_TIMEOUT_MSEC (120ms) when USB is enumerated
+  // but the host is not draining the buffer - i.e. powered over USB with no
+  // serial monitor open. A 120ms stall here freezes the pitch glide and the
+  // amplitude ramp, which is audible. Serial's operator bool() tests DTR, so
+  // this skips the writes entirely unless a monitor is genuinely attached.
+  // (On pure battery with no USB at all, usb_configuration is 0 and writes
+  // already return immediately, so this specifically covers the USB-for-power
+  // case.)
+  if (Serial && sincePrint >= SERIAL_PRINT_INTERVAL_MS) {
     sincePrint = 0;
 #if SERIAL_PLOTTER_MODE
     // Plotting tgt against smooth shows the glide doing its job: tgt is the
